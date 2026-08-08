@@ -2,10 +2,14 @@ package auction
 
 import (
 	"context"
+	"fmt"
 	"fullcycle-auction_go/configuration/logger"
 	"fullcycle-auction_go/internal/entity/auction_entity"
 	"fullcycle-auction_go/internal/internal_error"
+	"os"
+	"time"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 )
 
@@ -19,12 +23,14 @@ type AuctionEntityMongo struct {
 	Timestamp   int64                           `bson:"timestamp"`
 }
 type AuctionRepository struct {
-	Collection *mongo.Collection
+	Collection      *mongo.Collection
+	auctionInterval time.Duration
 }
 
 func NewAuctionRepository(database *mongo.Database) *AuctionRepository {
 	return &AuctionRepository{
-		Collection: database.Collection("auctions"),
+		Collection:      database.Collection("auctions"),
+		auctionInterval: getAuctionInterval(),
 	}
 }
 
@@ -46,5 +52,35 @@ func (ar *AuctionRepository) CreateAuction(
 		return internal_error.NewInternalServerError("Error trying to insert auction")
 	}
 
+	go ar.closeAuctionAfterInterval(auctionEntity.Id)
+
 	return nil
+}
+
+// closeAuctionAfterInterval waits out the auction's configured duration and
+// then flips its status to Closed. It runs detached from the HTTP request
+// that created the auction (which is gone long before the auction expires),
+// so it uses its own background context rather than the request's ctx.
+func (ar *AuctionRepository) closeAuctionAfterInterval(auctionId string) {
+	time.Sleep(ar.auctionInterval)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	filter := bson.M{"_id": auctionId}
+	update := bson.M{"$set": bson.M{"status": auction_entity.Completed}}
+
+	if _, err := ar.Collection.UpdateOne(ctx, filter, update); err != nil {
+		logger.Error(fmt.Sprintf("Error trying to close auction id = %s", auctionId), err)
+	}
+}
+
+func getAuctionInterval() time.Duration {
+	auctionInterval := os.Getenv("AUCTION_INTERVAL")
+	duration, err := time.ParseDuration(auctionInterval)
+	if err != nil {
+		return time.Minute * 5
+	}
+
+	return duration
 }
